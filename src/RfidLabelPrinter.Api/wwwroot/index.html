@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RFID Label Printer Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        :root{--bg:#0f0f1a;--surface:#1a1a2e;--card:#16213e;--primary:#0f3460;--accent:#e94560;--success:#00c9a7;--warning:#ffc93c;--fail:#e94560;--pending:#7b68ee;--processing:#00b4d8;--text:#e0e0e0;--text-dim:#8892b0;--border:rgba(255,255,255,0.06);--glow:0 0 20px rgba(233,69,96,0.15)}
+        body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+        .container{max-width:1200px;margin:0 auto;padding:24px}
+        header{display:flex;justify-content:space-between;align-items:center;margin-bottom:32px;padding:20px 24px;background:linear-gradient(135deg,var(--surface),var(--card));border-radius:16px;border:1px solid var(--border);box-shadow:var(--glow)}
+        header h1{font-size:1.5rem;font-weight:700;background:linear-gradient(135deg,#e94560,#0f3460);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+        header .status{display:flex;align-items:center;gap:8px;font-size:.85rem;color:var(--text-dim)}
+        header .dot{width:8px;height:8px;border-radius:50%;background:var(--success);animation:pulse 2s infinite}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+        .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:32px}
+        .stat-card{background:linear-gradient(135deg,var(--surface),var(--card));border-radius:14px;padding:24px;border:1px solid var(--border);transition:transform .2s,box-shadow .2s;position:relative;overflow:hidden}
+        .stat-card:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,0,0,.3)}
+        .stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;border-radius:14px 14px 0 0}
+        .stat-card.total::before{background:linear-gradient(90deg,#7b68ee,#00b4d8)}
+        .stat-card.pending::before{background:var(--pending)}
+        .stat-card.processing::before{background:var(--processing)}
+        .stat-card.success::before{background:var(--success)}
+        .stat-card.failed::before{background:var(--fail)}
+        .stat-card .label{font-size:.75rem;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-dim);margin-bottom:8px}
+        .stat-card .value{font-size:2rem;font-weight:700}
+        .stat-card.success .value{color:var(--success)}
+        .stat-card.failed .value{color:var(--fail)}
+        .stat-card.pending .value{color:var(--pending)}
+        .stat-card.processing .value{color:var(--processing)}
+        .progress-bar{margin-bottom:32px;background:var(--surface);border-radius:10px;height:8px;overflow:hidden;border:1px solid var(--border)}
+        .progress-bar .fill{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--success),#00e6c3);transition:width .6s ease}
+        .toolbar{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:center}
+        .toolbar select,.toolbar input{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:10px;font-size:.85rem;font-family:'Inter',sans-serif;outline:none;transition:border .2s}
+        .toolbar select:focus,.toolbar input:focus{border-color:var(--accent)}
+        .btn{padding:10px 20px;border:none;border-radius:10px;font-size:.85rem;font-weight:600;cursor:pointer;transition:all .2s;font-family:'Inter',sans-serif}
+        .btn-accent{background:linear-gradient(135deg,var(--accent),#c73e54);color:#fff}
+        .btn-accent:hover{box-shadow:0 4px 20px rgba(233,69,96,.4);transform:translateY(-1px)}
+        .btn-outline{background:transparent;color:var(--text-dim);border:1px solid var(--border)}
+        .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
+        .btn-success{background:linear-gradient(135deg,var(--success),#00a88a);color:#fff}
+        .btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important;box-shadow:none!important}
+        table{width:100%;border-collapse:separate;border-spacing:0;background:var(--surface);border-radius:14px;overflow:hidden;border:1px solid var(--border)}
+        th{background:var(--card);padding:14px 16px;text-align:left;font-size:.75rem;text-transform:uppercase;letter-spacing:1px;color:var(--text-dim);font-weight:600}
+        td{padding:12px 16px;border-top:1px solid var(--border);font-size:.85rem}
+        tr:hover td{background:rgba(255,255,255,.02)}
+        .badge{padding:4px 10px;border-radius:20px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+        .badge-pending{background:rgba(123,104,238,.15);color:var(--pending)}
+        .badge-processing{background:rgba(0,180,216,.15);color:var(--processing)}
+        .badge-success{background:rgba(0,201,167,.15);color:var(--success)}
+        .badge-failed{background:rgba(233,69,96,.15);color:var(--fail)}
+        .retry-btn{padding:4px 12px;border:1px solid var(--accent);background:transparent;color:var(--accent);border-radius:8px;cursor:pointer;font-size:.7rem;font-weight:600;transition:all .2s}
+        .retry-btn:hover{background:var(--accent);color:#fff}
+        .empty{text-align:center;padding:60px 20px;color:var(--text-dim)}
+        .empty svg{width:64px;height:64px;margin-bottom:16px;opacity:.3}
+        .pagination{display:flex;justify-content:center;gap:8px;margin-top:20px}
+        .pagination button{padding:8px 14px;background:var(--surface);border:1px solid var(--border);color:var(--text-dim);border-radius:8px;cursor:pointer;font-size:.8rem;transition:all .2s}
+        .pagination button.active,.pagination button:hover{border-color:var(--accent);color:var(--accent)}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+        .fade-in{animation:fadeIn .4s ease}
+        .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px}
+        @keyframes spin{to{transform:rotate(360deg)}}
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>🏷️ RFID Label Printer</h1>
+        <div class="status"><span class="dot"></span> System Active</div>
+    </header>
+
+    <div class="stats-grid" id="statsGrid">
+        <div class="stat-card total"><div class="label">Total Jobs</div><div class="value" id="totalJobs">—</div></div>
+        <div class="stat-card pending"><div class="label">Pending</div><div class="value" id="pendingCount">—</div></div>
+        <div class="stat-card processing"><div class="label">Processing</div><div class="value" id="processingCount">—</div></div>
+        <div class="stat-card success"><div class="label">Success</div><div class="value" id="successCount">—</div></div>
+        <div class="stat-card failed"><div class="label">Failed</div><div class="value" id="failedCount">—</div></div>
+    </div>
+
+    <div class="progress-bar"><div class="fill" id="progressFill" style="width:0%"></div></div>
+
+    <div class="toolbar">
+        <select id="statusFilter" onchange="loadJobs()">
+            <option value="">All Status</option>
+            <option value="Pending">Pending</option>
+            <option value="Processing">Processing</option>
+            <option value="Success">Success</option>
+            <option value="Failed">Failed</option>
+        </select>
+        <button class="btn btn-accent" onclick="retryAllFailed()" id="retryAllBtn">Retry All Failed</button>
+        <button class="btn btn-outline" onclick="loadAll()">⟳ Refresh</button>
+        <label style="margin-left:auto;font-size:.8rem;color:var(--text-dim)">
+            <input type="checkbox" id="autoRefresh" checked onchange="toggleAutoRefresh()"> Auto-refresh (5s)
+        </label>
+    </div>
+
+    <div id="tableContainer"></div>
+    <div class="pagination" id="pagination"></div>
+</div>
+
+<script>
+const API = '/api/print-jobs';
+let currentPage = 1, autoRefreshTimer = null;
+
+async function loadStats() {
+    try {
+        const r = await fetch(`${API}/stats`);
+        const s = await r.json();
+        document.getElementById('totalJobs').textContent = s.totalJobs;
+        document.getElementById('pendingCount').textContent = s.pendingCount;
+        document.getElementById('processingCount').textContent = s.processingCount;
+        document.getElementById('successCount').textContent = s.successCount;
+        document.getElementById('failedCount').textContent = s.failedCount;
+        const pct = s.totalJobs > 0 ? ((s.successCount / s.totalJobs) * 100).toFixed(1) : 0;
+        document.getElementById('progressFill').style.width = pct + '%';
+    } catch(e) { console.error('Stats error', e); }
+}
+
+async function loadJobs(page) {
+    if (page) currentPage = page;
+    const status = document.getElementById('statusFilter').value;
+    const url = `${API}?page=${currentPage}&pageSize=20${status ? '&status=' + status : ''}`;
+    try {
+        const r = await fetch(url);
+        const jobs = await r.json();
+        renderTable(jobs);
+    } catch(e) { console.error('Jobs error', e); }
+}
+
+function renderTable(jobs) {
+    const c = document.getElementById('tableContainer');
+    if (!jobs.length) {
+        c.innerHTML = '<div class="empty"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-3-3v6m-7 4h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg><p>No print jobs found</p></div>';
+        return;
+    }
+    let html = '<table class="fade-in"><thead><tr><th>ID</th><th>Barcode</th><th>Status</th><th>Retries</th><th>Batch</th><th>Created</th><th>Action</th></tr></thead><tbody>';
+    jobs.forEach(j => {
+        const badge = `badge-${j.status.toLowerCase()}`;
+        const time = new Date(j.createdAt).toLocaleString();
+        const batchShort = j.batchId.substring(0, 8);
+        const retryBtn = j.status === 'Failed' ? `<button class="retry-btn" onclick="retryJob(${j.id})">Retry</button>` : '—';
+        html += `<tr><td>#${j.id}</td><td><strong>${j.barcode}</strong></td><td><span class="badge ${badge}">${j.status}</span></td><td>${j.retryCount}</td><td title="${j.batchId}">${batchShort}…</td><td>${time}</td><td>${retryBtn}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    c.innerHTML = html;
+}
+
+async function retryJob(id) {
+    try {
+        await fetch(`${API}/${id}/retry`, { method: 'POST' });
+        loadAll();
+    } catch(e) { alert('Retry failed: ' + e.message); }
+}
+
+async function retryAllFailed() {
+    const btn = document.getElementById('retryAllBtn');
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Retrying...';
+    try {
+        await fetch(`${API}/retry-all-failed`, { method: 'POST' });
+        loadAll();
+    } catch(e) { alert('Retry failed'); }
+    finally { btn.disabled = false; btn.textContent = 'Retry All Failed'; }
+}
+
+function loadAll() { loadStats(); loadJobs(); }
+
+function toggleAutoRefresh() {
+    if (document.getElementById('autoRefresh').checked) {
+        autoRefreshTimer = setInterval(loadAll, 5000);
+    } else { clearInterval(autoRefreshTimer); }
+}
+
+loadAll();
+autoRefreshTimer = setInterval(loadAll, 5000);
+</script>
+</body>
+</html>

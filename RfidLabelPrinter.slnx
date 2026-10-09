@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RfidLabelPrinter.Api/RfidLabelPrinter.Api.csproj" />
+    <Project Path="src/RfidLabelPrinter.Core/RfidLabelPrinter.Core.csproj" />
+    <Project Path="src/RfidLabelPrinter.Infrastructure/RfidLabelPrinter.Infrastructure.csproj" />
+  </Folder>
+</Solution>

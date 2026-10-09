@@ -1,0 +1,50 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+msbuild.log
+msbuild.err
+msbuild.binlog
+
+## Local runtime / SDK artifacts
+.dotnet_home/
+.dotnet/
+artifacts/
+
+## Publish outputs & deployment packages
+publish/
+publish_*/
+*.zip
+*.7z
+*.rar
+*.tar.gz
+
+## Visual Studio & JetBrains / VS Code
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Logs and diagnostics
+*.log
+[Ll]ogs/
+[Ll]og/
+*.dmp
+*.dump
+
+## Sensitive settings & local overrides
+appsettings.*.local.json
+appsettings.local.json
+.env
+.env.*
+*.pfx
+*.certificate
+
+## OS generated files
+Thumbs.db
+desktop.ini
+.DS_Store
