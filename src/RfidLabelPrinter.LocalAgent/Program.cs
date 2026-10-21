@@ -147,8 +147,8 @@ public class PrinterWorker : BackgroundService
 
     private void LoadConfig()
     {
-        CloudApiUrl = _config["AgentSettings:CloudApiUrl"] ?? "";
-        PrinterIp = _config["AgentSettings:PrinterIp"] ?? "";
+        CloudApiUrl = (_config["AgentSettings:CloudApiUrl"] ?? "").Trim().TrimEnd('/');
+        PrinterIp = (_config["AgentSettings:PrinterIp"] ?? "").Trim();
         PrinterPort = int.Parse(_config["AgentSettings:PrinterPort"] ?? "9100");
         PollingIntervalMs = int.Parse(_config["AgentSettings:PollingIntervalMs"] ?? "300");
         ClaimBatchSize = int.Parse(_config["AgentSettings:ClaimBatchSize"] ?? "1");
@@ -306,16 +306,17 @@ public class PrinterWorker : BackgroundService
 
     private async Task<byte[]> DownloadPdfBytesAsync(string pdfUrl)
     {
+        string cleanUrl = (pdfUrl ?? "").Trim();
         Exception? lastError = null;
 
         for (int attempt = 1; attempt <= PdfDownloadRetryCount; attempt++)
         {
             try
             {
-                using var response = await _httpClient.GetAsync(pdfUrl);
+                using var response = await _httpClient.GetAsync(cleanUrl);
 
                 if (response.StatusCode == HttpStatusCode.NotFound)
-                    throw new Exception($"PDF URL returned 404 (Not Found): {pdfUrl}");
+                    throw new Exception($"PDF URL returned 404 (Not Found): {cleanUrl}");
 
                 response.EnsureSuccessStatusCode();
                 return await response.Content.ReadAsByteArrayAsync();
@@ -323,7 +324,7 @@ public class PrinterWorker : BackgroundService
             catch (Exception ex)
             {
                 lastError = ex;
-                _logger.LogWarning(ex, "PDF download failed on attempt {Attempt}/{Max}: {Url}", attempt, PdfDownloadRetryCount, pdfUrl);
+                _logger.LogWarning(ex, "PDF download failed on attempt {Attempt}/{Max}: {Url}", attempt, PdfDownloadRetryCount, cleanUrl);
 
                 if (attempt < PdfDownloadRetryCount)
                     await Task.Delay(PdfDownloadRetryDelayMs);
@@ -484,14 +485,27 @@ public class PrinterWorker : BackgroundService
         if (!DumpZplToFile)
             return;
 
-        string targetPath = DumpZplPath;
-        if (string.IsNullOrWhiteSpace(targetPath))
+        try
         {
-            targetPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "zpl-dump.txt");
-        }
+            string targetPath = DumpZplPath;
+            if (string.IsNullOrWhiteSpace(targetPath))
+            {
+                targetPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "zpl-dump.txt");
+            }
 
-        string header = $"\n----- {DateTime.Now:yyyy-MM-dd HH:mm:ss} JobId={job.Id} Barcode={job.Barcode} -----\n";
-        File.AppendAllText(targetPath, header + zpl + "\n");
+            string? dir = Path.GetDirectoryName(targetPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            string header = $"\n----- {DateTime.Now:yyyy-MM-dd HH:mm:ss} JobId={job.Id} Barcode={job.Barcode} -----\n";
+            File.AppendAllText(targetPath, header + zpl + "\n");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not write ZPL dump to file.");
+        }
     }
 
     private string GetRfidZpl(string barcode)
@@ -689,38 +703,44 @@ public class PrinterWorker : BackgroundService
 
         foreach (var skBitmap in skBitmaps)
         {
-            _logger.LogDebug("Rendered PDF Page: {W}x{H} pixels", skBitmap.Width, skBitmap.Height);
-
-            // 1. Auto-trim whitespace around content so design starts right at the edge (no dead padding)
-            using var prepared = AutoTrimWhitespace ? TrimWhitespaceBorders(skBitmap) : skBitmap.Copy();
-
-            // 2. Determine printable bounds based on PrintOffsetX
-            int targetX = Math.Max(0, PrintOffsetX);
-            int availableWidth = Math.Max(50, LabelWidthDots - targetX);
-            int availableHeight = Math.Max(50, LabelLengthDots);
-
-            // 3. Scale proportionally using PdfSizePercent, guaranteed never to cut off on the right
-            using var resized = ResizeForLabel(prepared, availableWidth, availableHeight);
-
-            // 4. Calculate vertical position without clipping!
-            int targetY = PrintOffsetY;
-            labelTopShift = LabelTopShiftDots;
-
-            // If user sets a negative offset (moving label higher than 0),
-            // instead of cutting off top pixels, we shift Zebra's physical feed via native ^LT!
-            if (targetY < 0)
+            try
             {
-                labelTopShift += targetY;
-                targetY = 0; // Content remains 100% complete at top (zero pixels cut off!)
+                _logger.LogDebug("Rendered PDF Page: {W}x{H} pixels", skBitmap.Width, skBitmap.Height);
+
+                // 1. Auto-trim whitespace around content so design starts right at the edge (no dead padding)
+                using var prepared = AutoTrimWhitespace ? TrimWhitespaceBorders(skBitmap) : skBitmap.Copy();
+
+                // 2. Determine printable bounds based on PrintOffsetX and PrintOffsetY
+                int targetX = Math.Max(0, PrintOffsetX);
+                int targetY = PrintOffsetY;
+                labelTopShift = LabelTopShiftDots;
+
+                // If user sets a negative offset (moving label higher than 0),
+                // instead of cutting off top pixels, we shift Zebra's physical feed via native ^LT!
+                if (targetY < 0)
+                {
+                    labelTopShift += targetY;
+                    targetY = 0; // Content remains 100% complete at top (zero pixels cut off!)
+                }
+
+                labelTopShift = Math.Clamp(labelTopShift, -120, 120);
+
+                int availableWidth = Math.Max(50, LabelWidthDots - targetX);
+                int availableHeight = Math.Max(50, LabelLengthDots - targetY);
+
+                // 3. Scale proportionally using PdfSizePercent, guaranteed never to cut off on right or bottom
+                using var resized = ResizeForLabel(prepared, availableWidth, availableHeight);
+
+                _logger.LogInformation("Placing graphic: X={X}, Y={Y}, Size={W}x{H}, LabelTopShift={LT}",
+                    targetX, targetY, resized.Width, resized.Height, labelTopShift);
+
+                // 4. Send graphic starting directly at ^FO{targetX},{targetY}
+                return ConvertSkiaBitmapToZplGraphics(resized, targetX, targetY);
             }
-
-            labelTopShift = Math.Clamp(labelTopShift, -120, 120);
-
-            _logger.LogInformation("Placing graphic: X={X}, Y={Y}, Size={W}x{H}, LabelTopShift={LT}",
-                targetX, targetY, resized.Width, resized.Height, labelTopShift);
-
-            // 5. Send graphic starting directly at ^FO{targetX},{targetY}
-            return ConvertSkiaBitmapToZplGraphics(resized, targetX, targetY);
+            finally
+            {
+                skBitmap.Dispose();
+            }
         }
 
         throw new Exception("Could not render PDF to image.");
