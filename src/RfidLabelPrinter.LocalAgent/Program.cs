@@ -90,6 +90,8 @@ public class PrinterWorker : BackgroundService
     private int PdfSizePercent = 55;
     private bool AutoCenterOnFlap = true;
     private bool AutoTrimWhitespace = true;
+    private bool SingleSidePrintOnLowerFlap = true;
+    private int SingleSideOffsetY = 0;
     private int LabelTopShiftDots = 0;
     private int PrintAreaWidthDots = 0;
     private int PrintAreaHeightDots = 0;
@@ -241,6 +243,9 @@ public class PrinterWorker : BackgroundService
         AutoTrimWhitespace = bool.TryParse(
             _config["AgentSettings:AutoTrimWhitespace"] ?? _config["AgentSettings:TrimPdfWhitespace"],
             out var autoTrim) ? autoTrim : true;
+
+        SingleSidePrintOnLowerFlap = bool.TryParse(_config["AgentSettings:SingleSidePrintOnLowerFlap"], out var ssLower) ? ssLower : true;
+        SingleSideOffsetY = ParseInt(_config["AgentSettings:SingleSideOffsetY"], 0);
 
         LabelTopShiftDots = ParseInt(_config["AgentSettings:LabelTopShiftDots"], 0);
 
@@ -837,8 +842,17 @@ public class PrinterWorker : BackgroundService
             {
                 _logger.LogDebug("Rendered PDF Page: {W}x{H} pixels", skBitmap.Width, skBitmap.Height);
 
+                int origHeight = skBitmap.Height;
+                int cropTop = 0, cropBottom = origHeight, cropLeft = 0, cropRight = skBitmap.Width;
+
                 // 1. Auto-trim whitespace around content so design starts right at the edge (no dead padding)
-                using var prepared = AutoTrimWhitespace ? TrimWhitespaceBorders(skBitmap) : skBitmap.Copy();
+                using var prepared = AutoTrimWhitespace
+                    ? TrimWhitespaceBorders(skBitmap, out cropTop, out cropBottom, out cropLeft, out cropRight)
+                    : skBitmap.Copy();
+
+                float topRatio = (float)cropTop / origHeight;
+                // Single-sided label detection: all ink is in lower half of template (no top wing content)
+                bool isSingleSideLower = topRatio >= 0.45f;
 
                 // 2. Determine printable bounds based on PrintOffsetX and PrintOffsetY
                 int targetX = Math.Max(0, PrintOffsetX);
@@ -866,11 +880,45 @@ public class PrinterWorker : BackgroundService
                 // 3. Scale proportionally using PdfSizePercent, guaranteed never to cut off on right or bottom
                 using var resized = ResizeForLabel(prepared, availableWidth, availableHeight);
 
-                // If AutoCenterOnFlap is enabled, auto-calculate center; otherwise use PrintOffsetX & PrintOffsetY directly
+                // Automatic vertical handling for Single-Sided vs Double-Sided labels:
+                if (SingleSidePrintOnLowerFlap && isSingleSideLower)
+                {
+                    if (SingleSideOffsetY > 0)
+                    {
+                        targetY = SingleSideOffsetY;
+                    }
+                    else
+                    {
+                        // Calculate offset aligning with lower wing position of double-sided templates:
+                        int baseTop = (int)(origHeight * 0.225f);
+                        float scaleH = (float)resized.Height / Math.Max(1, prepared.Height);
+                        int offsetFromUpperWing = Math.Max(0, (int)Math.Round((cropTop - baseTop) * scaleH));
+                        targetY = PrintOffsetY + offsetFromUpperWing;
+
+                        // Ensure content cleanly lands on lower flap (lower 50% of label)
+                        int lowerFlapStart = LabelLengthDots / 2;
+                        int lowerFlapHeight = LabelLengthDots - lowerFlapStart;
+                        if (targetY < lowerFlapStart)
+                        {
+                            targetY = lowerFlapStart + Math.Max(0, (lowerFlapHeight - resized.Height) / 2);
+                        }
+                    }
+
+                    _logger.LogInformation("Single-sided label detected (ink in lower flap). Placing at Lower Flap Y={Y}", targetY);
+                }
+                else
+                {
+                    // If AutoCenterOnFlap is enabled for double-sided designs
+                    if (AutoCenterOnFlap)
+                    {
+                        targetY = Math.Max(0, (referenceFlapHeight - resized.Height) / 2);
+                    }
+                }
+
+                // If AutoCenterOnFlap is enabled, auto-calculate horizontal center
                 if (AutoCenterOnFlap)
                 {
                     targetX = defaultFlapOffsetX + Math.Max(0, (referenceFlapWidth - resized.Width) / 2);
-                    targetY = Math.Max(0, (referenceFlapHeight - resized.Height) / 2);
                 }
 
                 // Hard boundary safety clamp: ensure graphic never spills over right or bottom physical edges
@@ -884,8 +932,8 @@ public class PrinterWorker : BackgroundService
                     targetY = Math.Max(0, LabelLengthDots - resized.Height);
                 }
 
-                _logger.LogInformation("Placing graphic: X={X}, Y={Y}, Size={W}x{H}, LabelTopShift={LT}",
-                    targetX, targetY, resized.Width, resized.Height, labelTopShift);
+                _logger.LogInformation("Placing graphic: X={X}, Y={Y}, Size={W}x{H}, LabelTopShift={LT}, IsSingleSideLower={SingleSide}",
+                    targetX, targetY, resized.Width, resized.Height, labelTopShift, isSingleSideLower);
 
                 // 4. Send graphic starting directly at ^FO{targetX},{targetY}
                 return ConvertSkiaBitmapToZplGraphics(resized, targetX, targetY);
@@ -1064,8 +1112,18 @@ public class PrinterWorker : BackgroundService
 
     private SKBitmap TrimWhitespaceBorders(SKBitmap source)
     {
-        if (source.Width <= 0 || source.Height <= 0)
-            return source;
+        return TrimWhitespaceBorders(source, out _, out _, out _, out _);
+    }
+
+    private SKBitmap TrimWhitespaceBorders(SKBitmap source, out int cropTop, out int cropBottom, out int cropLeft, out int cropRight)
+    {
+        cropTop = 0;
+        cropBottom = source?.Height ?? 0;
+        cropLeft = 0;
+        cropRight = source?.Width ?? 0;
+
+        if (source == null || source.Width <= 0 || source.Height <= 0)
+            return source?.Copy() ?? new SKBitmap();
 
         unsafe
         {
@@ -1108,10 +1166,10 @@ public class PrinterWorker : BackgroundService
             int paddingX = 4;
             int paddingY = 4;
 
-            int cropLeft = Math.Max(0, left - paddingX);
-            int cropTop = Math.Max(0, top - paddingY);
-            int cropRight = Math.Min(source.Width, right + paddingX + 1);
-            int cropBottom = Math.Min(source.Height, bottom + paddingY + 1);
+            cropLeft = Math.Max(0, left - paddingX);
+            cropTop = Math.Max(0, top - paddingY);
+            cropRight = Math.Min(source.Width, right + paddingX + 1);
+            cropBottom = Math.Min(source.Height, bottom + paddingY + 1);
 
             int cropWidth = Math.Max(1, cropRight - cropLeft);
             int cropHeight = Math.Max(1, cropBottom - cropTop);
