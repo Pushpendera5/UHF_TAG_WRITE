@@ -36,7 +36,20 @@ public class Program
             {
                 logging.ClearProviders();
                 logging.AddConsole();
-                logging.AddEventLog();
+                if (OperatingSystem.IsWindows())
+                {
+                    try
+                    {
+                        logging.AddEventLog(options =>
+                        {
+                            options.SourceName = "RfidLabelPrinterAgent";
+                        });
+                    }
+                    catch
+                    {
+                        // Ignore if running as non-admin in console mode
+                    }
+                }
             })
             .Build();
 
@@ -46,8 +59,8 @@ public class Program
 
 public class PrinterWorker : BackgroundService
 {
-    private const int DefaultLabelWidthDots = 800;
-    private const int DefaultLabelLengthDots = 400;
+    private const int DefaultLabelWidthDots = 1181;
+    private const int DefaultLabelLengthDots = 591;
     private const int DefaultEpcWordCount = 6;
 
     private readonly ILogger<PrinterWorker> _logger;
@@ -64,7 +77,7 @@ public class PrinterWorker : BackgroundService
     private int PdfRenderDpi = 300;
     private int PdfDownloadRetryCount = 5;
     private int PdfDownloadRetryDelayMs = 800;
-    private int PrinterDpi = 203;
+    private int PrinterDpi = 300;
     private int BlackThreshold = 240;
     private int AlphaThreshold = 5;
     private int LabelWidthDots = DefaultLabelWidthDots;
@@ -72,11 +85,14 @@ public class PrinterWorker : BackgroundService
     private bool PrintPdfAsGraphics = true;
 
     // --- Clean Positioning & Sizing Controls ---
-    private int PrintOffsetX = 400;
-    private int PrintOffsetY = 10;
-    private int PdfSizePercent = 70;
+    private int PrintOffsetX = 590;
+    private int PrintOffsetY = 15;
+    private int PdfSizePercent = 55;
+    private bool AutoCenterOnFlap = true;
     private bool AutoTrimWhitespace = true;
     private int LabelTopShiftDots = 0;
+    private int PrintAreaWidthDots = 0;
+    private int PrintAreaHeightDots = 0;
 
     // --- RFID Parameters (100% Preserved) ---
     private string RfidMode = "H";
@@ -110,8 +126,8 @@ public class PrinterWorker : BackgroundService
         _logger.LogInformation("Local Printer: {Ip}:{Port}", PrinterIp, PrinterPort);
         _logger.LogInformation("RFID Write: {Status}", EnableRfidWrite ? "Enabled" : "Disabled");
         _logger.LogInformation("Printer DPI: {Dpi}, Label Size: {W}x{H} dots", PrinterDpi, LabelWidthDots, LabelLengthDots);
-        _logger.LogInformation("Positioning: OffsetX={X}, OffsetY={Y}, Size={Scale}%, AutoTrim={Trim}",
-            PrintOffsetX, PrintOffsetY, PdfSizePercent, AutoTrimWhitespace ? "Yes" : "No");
+        _logger.LogInformation("Positioning: OffsetX={X}, OffsetY={Y}, Size={Scale}%, AutoCenter={Center}, AutoTrim={Trim}",
+            PrintOffsetX, PrintOffsetY, PdfSizePercent, AutoCenterOnFlap ? "Yes" : "No", AutoTrimWhitespace ? "Yes" : "No");
         _logger.LogInformation("RFID Params: ^RFW,{Mode},{Block},{Start},{Words}, BankFormat={Bank}",
             RfidMode, RfidBlockNumber, RfidStartWord, RfidWordCount, UseEpcBankWriteFormat ? "Enabled" : "Disabled");
         _logger.LogInformation("--------------------------------------------------");
@@ -130,47 +146,64 @@ public class PrinterWorker : BackgroundService
             _logger.LogWarning(ex, "Startup: could not call reset-stale-processing (API may be unreachable).");
         }
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try { await ProcessPendingJobsAsync(stoppingToken); }
-            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "Error during job processing cycle");
+                try { await ProcessPendingJobsAsync(stoppingToken); }
+                catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogError(ex, "Error during job processing cycle");
+                }
+
+                // Reload runtime-adjustable settings without restarting the agent.
+                try { LoadConfig(); } catch { /* keep last known config */ }
+
+                await Task.Delay(PollingIntervalMs, stoppingToken);
             }
-
-            // Reload runtime-adjustable settings without restarting the agent.
-            try { LoadConfig(); } catch { /* keep last known config */ }
-
-            await Task.Delay(PollingIntervalMs, stoppingToken);
         }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            _logger.LogInformation("Agent background service stopping gracefully.");
+        }
+    }
+
+    private static int ParseInt(string? value, int fallback)
+    {
+        return int.TryParse(value?.Trim(), out var parsed) ? parsed : fallback;
     }
 
     private void LoadConfig()
     {
         CloudApiUrl = (_config["AgentSettings:CloudApiUrl"] ?? "").Trim().TrimEnd('/');
         PrinterIp = (_config["AgentSettings:PrinterIp"] ?? "").Trim();
-        PrinterPort = int.Parse(_config["AgentSettings:PrinterPort"] ?? "9100");
-        PollingIntervalMs = int.Parse(_config["AgentSettings:PollingIntervalMs"] ?? "300");
-        ClaimBatchSize = int.Parse(_config["AgentSettings:ClaimBatchSize"] ?? "1");
-        ClaimMaxLoopsPerCycle = int.Parse(_config["AgentSettings:ClaimMaxLoopsPerCycle"] ?? "10");
+        PrinterPort = ParseInt(_config["AgentSettings:PrinterPort"], 9100);
+        PollingIntervalMs = ParseInt(_config["AgentSettings:PollingIntervalMs"], 300);
+        ClaimBatchSize = ParseInt(_config["AgentSettings:ClaimBatchSize"], 1);
+        ClaimMaxLoopsPerCycle = ParseInt(_config["AgentSettings:ClaimMaxLoopsPerCycle"], 10);
         EnableRfidWrite = bool.TryParse(_config["AgentSettings:EnableRfidWrite"], out var enableRfid) ? enableRfid : true;
-        PdfRenderDpi = int.Parse(_config["AgentSettings:PdfRenderDpi"] ?? "300");
-        PdfDownloadRetryCount = Math.Max(1, int.Parse(_config["AgentSettings:PdfDownloadRetryCount"] ?? "5"));
-        PdfDownloadRetryDelayMs = Math.Max(0, int.Parse(_config["AgentSettings:PdfDownloadRetryDelayMs"] ?? "800"));
+        PdfRenderDpi = ParseInt(_config["AgentSettings:PdfRenderDpi"], 300);
+        PdfDownloadRetryCount = Math.Max(1, ParseInt(_config["AgentSettings:PdfDownloadRetryCount"], 5));
+        PdfDownloadRetryDelayMs = Math.Max(0, ParseInt(_config["AgentSettings:PdfDownloadRetryDelayMs"], 800));
 
-        // Standard Printer DPI (correct any invalid 230 DPI to standard 203)
-        PrinterDpi = int.Parse(_config["AgentSettings:PrinterDpi"] ?? "203");
-        if (PrinterDpi <= 0 || PrinterDpi == 230)
-            PrinterDpi = 203;
+        // Standard Printer DPI (correct any invalid <= 0 DPI to standard 300)
+        PrinterDpi = ParseInt(_config["AgentSettings:PrinterDpi"], 300);
+        if (PrinterDpi <= 0)
+            PrinterDpi = 300;
 
-        BlackThreshold = int.Parse(_config["AgentSettings:BlackThreshold"] ?? "240");
-        AlphaThreshold = int.Parse(_config["AgentSettings:AlphaThreshold"] ?? "5");
+        BlackThreshold = ParseInt(_config["AgentSettings:BlackThreshold"], 240);
+        AlphaThreshold = ParseInt(_config["AgentSettings:AlphaThreshold"], 5);
 
-        LabelWidthDots = int.Parse(_config["AgentSettings:LabelWidthDots"] ?? DefaultLabelWidthDots.ToString());
-        LabelLengthDots = int.Parse(_config["AgentSettings:LabelLengthDots"] ?? DefaultLabelLengthDots.ToString());
+        int defaultWidth = PrinterDpi >= 300 ? 1181 : 800;
+        int defaultLength = PrinterDpi >= 300 ? 591 : 400;
+        int defaultOffsetX = PrinterDpi >= 300 ? 590 : 400;
+        int defaultOffsetY = PrinterDpi >= 300 ? 15 : 10;
 
-        int labelWidthMm = int.Parse(_config["AgentSettings:LabelWidthMm"] ?? "0");
-        int labelHeightMm = int.Parse(_config["AgentSettings:LabelHeightMm"] ?? "0");
+        LabelWidthDots = ParseInt(_config["AgentSettings:LabelWidthDots"], defaultWidth);
+        LabelLengthDots = ParseInt(_config["AgentSettings:LabelLengthDots"], defaultLength);
+
+        int labelWidthMm = ParseInt(_config["AgentSettings:LabelWidthMm"], 0);
+        int labelHeightMm = ParseInt(_config["AgentSettings:LabelHeightMm"], 0);
         if (labelWidthMm > 0)
             LabelWidthDots = MmToDotsAtDpi(labelWidthMm, PrinterDpi);
         if (labelHeightMm > 0)
@@ -179,51 +212,74 @@ public class PrinterWorker : BackgroundService
         PrintPdfAsGraphics = bool.TryParse(_config["AgentSettings:PrintPdfAsGraphics"], out var printPdf) ? printPdf : true;
 
         // Clean Positioning Parameters with backward compatibility fallbacks
-        PrintOffsetX = int.Parse(
+        PrintOffsetX = ParseInt(
             _config["AgentSettings:PrintOffsetX"] ??
             _config["AgentSettings:PdfLeftRightDots"] ??
-            _config["AgentSettings:PdfOffsetXDots"] ??
-            "400");
+            _config["AgentSettings:PdfOffsetXDots"],
+            defaultOffsetX);
 
-        PrintOffsetY = int.Parse(
+        PrintOffsetY = ParseInt(
             _config["AgentSettings:PrintOffsetY"] ??
             _config["AgentSettings:PdfUpDownDots"] ??
-            _config["AgentSettings:PdfOffsetYDots"] ??
-            "10");
+            _config["AgentSettings:PdfOffsetYDots"],
+            defaultOffsetY);
+
+        int printOffsetXMm = ParseInt(_config["AgentSettings:PrintOffsetXMm"], 0);
+        int printOffsetYMm = ParseInt(_config["AgentSettings:PrintOffsetYMm"], 0);
+        if (printOffsetXMm > 0)
+            PrintOffsetX = MmToDotsAtDpi(printOffsetXMm, PrinterDpi);
+        if (printOffsetYMm > 0)
+            PrintOffsetY = MmToDotsAtDpi(printOffsetYMm, PrinterDpi);
 
         PdfSizePercent = Math.Clamp(
-            int.Parse(_config["AgentSettings:PdfSizePercent"] ?? _config["AgentSettings:PdfScalePercent"] ?? "70"),
+            ParseInt(_config["AgentSettings:PdfSizePercent"] ?? _config["AgentSettings:PdfScalePercent"], 55),
             10,
             200);
+
+        AutoCenterOnFlap = bool.TryParse(_config["AgentSettings:AutoCenterOnFlap"], out var autoCenter) ? autoCenter : true;
 
         AutoTrimWhitespace = bool.TryParse(
             _config["AgentSettings:AutoTrimWhitespace"] ?? _config["AgentSettings:TrimPdfWhitespace"],
             out var autoTrim) ? autoTrim : true;
 
-        LabelTopShiftDots = int.Parse(_config["AgentSettings:LabelTopShiftDots"] ?? "0");
+        LabelTopShiftDots = ParseInt(_config["AgentSettings:LabelTopShiftDots"], 0);
+
+        PrintAreaWidthDots = ParseInt(_config["AgentSettings:PrintAreaWidthDots"], 0);
+        PrintAreaHeightDots = ParseInt(_config["AgentSettings:PrintAreaHeightDots"], 0);
+
+        int printAreaWidthMm = ParseInt(_config["AgentSettings:PrintAreaWidthMm"], 0);
+        int printAreaHeightMm = ParseInt(_config["AgentSettings:PrintAreaHeightMm"], 0);
+        if (printAreaWidthMm > 0)
+            PrintAreaWidthDots = MmToDotsAtDpi(printAreaWidthMm, PrinterDpi);
+        if (printAreaHeightMm > 0)
+            PrintAreaHeightDots = MmToDotsAtDpi(printAreaHeightMm, PrinterDpi);
 
         // --- RFID Parameters (100% UNTOUCHED) ---
         RfidMode = (_config["AgentSettings:RfidMode"] ?? "H").Trim().ToUpperInvariant();
-        RfidBlockNumber = int.Parse(_config["AgentSettings:RfidBlockNumber"] ?? "1");
-        RfidStartWord = int.Parse(_config["AgentSettings:RfidStartWord"] ?? "2");
-        RfidWordCount = int.Parse(_config["AgentSettings:RfidWordCount"] ?? "4");
+        RfidBlockNumber = ParseInt(_config["AgentSettings:RfidBlockNumber"], 1);
+        RfidStartWord = ParseInt(_config["AgentSettings:RfidStartWord"], 2);
+        RfidWordCount = ParseInt(_config["AgentSettings:RfidWordCount"], 4);
         RfidClearTrailingEpcWords = bool.TryParse(_config["AgentSettings:RfidClearTrailingEpcWords"], out var clearEpc) ? clearEpc : false;
-        RfidTotalEpcWordsToClear = int.Parse(_config["AgentSettings:RfidTotalEpcWordsToClear"] ?? DefaultEpcWordCount.ToString());
+        RfidTotalEpcWordsToClear = ParseInt(_config["AgentSettings:RfidTotalEpcWordsToClear"], DefaultEpcWordCount);
         UseEpcBankWriteFormat = bool.TryParse(_config["AgentSettings:UseEpcBankWriteFormat"], out var useEpcBank) ? useEpcBank : true;
         RfidHexInputMode = (_config["AgentSettings:RfidHexInputMode"] ?? "Always").Trim();
         DumpZplToFile = bool.TryParse(_config["AgentSettings:DumpZplToFile"], out var dumpZpl) ? dumpZpl : true;
         DumpZplPath = _config["AgentSettings:DumpZplPath"] ?? "";
-        InterJobDelayMs = int.Parse(_config["AgentSettings:InterJobDelayMs"] ?? "500");
+        InterJobDelayMs = ParseInt(_config["AgentSettings:InterJobDelayMs"], 500);
         PreferPdfTextToZpl = bool.TryParse(_config["AgentSettings:PreferPdfTextToZpl"], out var preferText) ? preferText : false;
     }
 
     private async Task ProcessPendingJobsAsync(CancellationToken stoppingToken)
     {
         int loopCount = 0;
-        while (loopCount < ClaimMaxLoopsPerCycle)
+        while (loopCount < ClaimMaxLoopsPerCycle && !stoppingToken.IsCancellationRequested)
         {
             var response = await _httpClient.PostAsync($"{CloudApiUrl}/claim?batchSize={ClaimBatchSize}", null, stoppingToken);
-            if (!response.IsSuccessStatusCode) return;
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Claim API returned status {StatusCode}: {Reason}", response.StatusCode, response.ReasonPhrase);
+                return;
+            }
 
             var jobs = await response.Content.ReadFromJsonAsync<List<PrintJobDto>>(stoppingToken);
             if (jobs == null || jobs.Count == 0) return;
@@ -232,6 +288,8 @@ public class PrinterWorker : BackgroundService
 
             for (int i = 0; i < jobs.Count; i++)
             {
+                if (stoppingToken.IsCancellationRequested) break;
+
                 var job = jobs[i];
                 _logger.LogInformation("Job {Id}: Processing {Barcode}", job.Id, job.Barcode);
 
@@ -248,7 +306,7 @@ public class PrinterWorker : BackgroundService
                     _logger.LogError(ex, "Job {Id}: Failed - {Message}", job.Id, ex.Message);
                 }
 
-                if (i < jobs.Count - 1 && InterJobDelayMs > 0)
+                if (i < jobs.Count - 1 && InterJobDelayMs > 0 && !stoppingToken.IsCancellationRequested)
                     await Task.Delay(InterJobDelayMs, stoppingToken);
             }
 
@@ -258,7 +316,8 @@ public class PrinterWorker : BackgroundService
 
     private async Task<byte[]> PreparePrinterDataAsync(PrintJobDto job)
     {
-        string rfidCmd = GetRfidZpl(job.Barcode);
+        string cleanBarcode = (job.Barcode ?? "").Trim();
+        string rfidCmd = GetRfidZpl(cleanBarcode);
 
         // If the incoming LabelZpl already contains an RFID write command, skip agent-side injection
         bool labelAlreadyContainsRfid = !string.IsNullOrWhiteSpace(job.LabelZpl) &&
@@ -271,11 +330,31 @@ public class PrinterWorker : BackgroundService
 
         if (IsPdfUrl(job.LabelZpl))
         {
-            _logger.LogInformation("Job {Id}: PDF URL detected. Downloading...", job.Id);
-            var pdfBytes = await DownloadPdfBytesAsync(job.LabelZpl);
-            string zplPayload = BuildPdfJobZpl(job, pdfBytes, rfidCmd);
-            WriteZplDump(job, zplPayload);
-            return Encoding.ASCII.GetBytes(zplPayload);
+            _logger.LogInformation("Job {Id}: URL detected. Downloading...", job.Id);
+            var downloadedBytes = await DownloadPdfBytesAsync(job.LabelZpl);
+
+            bool isPdf = downloadedBytes.Length >= 4 &&
+                         downloadedBytes[0] == '%' &&
+                         downloadedBytes[1] == 'P' &&
+                         downloadedBytes[2] == 'D' &&
+                         downloadedBytes[3] == 'F';
+
+            if (isPdf)
+            {
+                string zplPayload = BuildPdfJobZpl(job, downloadedBytes, rfidCmd);
+                WriteZplDump(job, zplPayload);
+                return Encoding.ASCII.GetBytes(zplPayload);
+            }
+            else
+            {
+                string downloadedZpl = Encoding.UTF8.GetString(downloadedBytes);
+                string sizeCmd = (LabelWidthDots > 0 && LabelLengthDots > 0) ? $"^PW{LabelWidthDots}\n^LL{LabelLengthDots}\n" : "";
+                string downloadedZplFinal = downloadedZpl.Contains("^XA") 
+                    ? ApplyLabelOffsets(downloadedZpl.Replace("^XA", $"^XA\n^PQ1\n{sizeCmd}{rfidCmd}")) 
+                    : $"^XA\n^PQ1\n{sizeCmd}{rfidCmd}{ApplyLabelOffsets(downloadedZpl)}\n^XZ";
+                WriteZplDump(job, downloadedZplFinal);
+                return Encoding.ASCII.GetBytes(downloadedZplFinal);
+            }
         }
 
         if (IsPdfBase64(job.LabelZpl))
@@ -287,9 +366,17 @@ public class PrinterWorker : BackgroundService
             return Encoding.ASCII.GetBytes(zplPayload);
         }
 
+        if (string.IsNullOrWhiteSpace(job.LabelZpl))
+        {
+            string simpleZpl = BuildSimpleBarcodeLabel(cleanBarcode, rfidCmd);
+            WriteZplDump(job, simpleZpl);
+            return Encoding.ASCII.GetBytes(simpleZpl);
+        }
+
+        string rawSizeCmd = (LabelWidthDots > 0 && LabelLengthDots > 0) ? $"^PW{LabelWidthDots}\n^LL{LabelLengthDots}\n" : "";
         string zplFinal = job.LabelZpl.Contains("^XA") 
-            ? ApplyLabelOffsets(job.LabelZpl.Replace("^XA", $"^XA\n^PQ1\n{rfidCmd}")) 
-            : $"^XA\n^PQ1\n{rfidCmd}{ApplyLabelOffsets(job.LabelZpl)}\n^XZ";
+            ? ApplyLabelOffsets(job.LabelZpl.Replace("^XA", $"^XA\n^PQ1\n{rawSizeCmd}{rfidCmd}")) 
+            : $"^XA\n^PQ1\n{rawSizeCmd}{rfidCmd}{ApplyLabelOffsets(job.LabelZpl)}\n^XZ";
 
         WriteZplDump(job, zplFinal);
         return Encoding.ASCII.GetBytes(zplFinal);
@@ -297,6 +384,20 @@ public class PrinterWorker : BackgroundService
 
     private string BuildPdfJobZpl(PrintJobDto job, byte[] pdfBytes, string rfidCmd)
     {
+        if (PreferPdfTextToZpl || !PrintPdfAsGraphics)
+        {
+            try
+            {
+                string textZpl = ConvertPdfBytesToUniversalTextZpl(pdfBytes, job.Barcode);
+                _logger.LogInformation("Job {Id}: Generated text-based ZPL from PDF.", job.Id);
+                return $"^XA\n^PQ1\n^PW{LabelWidthDots}\n^LL{LabelLengthDots}\n{rfidCmd}{textZpl}^XZ";
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Job {Id}: Text extraction failed, falling back to graphics rendering.", job.Id);
+            }
+        }
+
         string graphicsZpl = ConvertPdfBytesToZplGraphics(pdfBytes, out int labelTopShift);
         _logger.LogInformation("Job {Id}: Generated graphics-based ZPL from PDF. Position=({X},{Y})", job.Id, PrintOffsetX, PrintOffsetY);
 
@@ -316,10 +417,15 @@ public class PrinterWorker : BackgroundService
                 using var response = await _httpClient.GetAsync(cleanUrl);
 
                 if (response.StatusCode == HttpStatusCode.NotFound)
-                    throw new Exception($"PDF URL returned 404 (Not Found): {cleanUrl}");
+                    throw new FileNotFoundException($"PDF URL returned 404 (Not Found): {cleanUrl}");
 
                 response.EnsureSuccessStatusCode();
                 return await response.Content.ReadAsByteArrayAsync();
+            }
+            catch (FileNotFoundException)
+            {
+                // Fail immediately on 404 without wasting time on retries
+                throw;
             }
             catch (Exception ex)
             {
@@ -418,11 +524,12 @@ public class PrinterWorker : BackgroundService
 
         int left = PrintOffsetX;
         int top = Math.Max(10, PrintOffsetY);
-        int lineHeight = 30;
-        int maxTextHeight = Math.Max(80, LabelLengthDots - 150);
+        int lineHeight = PrinterDpi >= 300 ? 44 : 30;
+        int maxTextHeight = Math.Max(80, LabelLengthDots - (PrinterDpi >= 300 ? 180 : 120));
         int maxLines = Math.Max(1, maxTextHeight / lineHeight);
 
-        sb.Append("^CF0,28\n");
+        int fontSize = PrinterDpi >= 300 ? 38 : 28;
+        sb.Append($"^CF0,{fontSize}\n");
 
         int printed = 0;
         foreach (var line in lines)
@@ -438,9 +545,12 @@ public class PrinterWorker : BackgroundService
         string barcodeData = SanitizeBarcodeData(barcode);
         if (!string.IsNullOrWhiteSpace(barcodeData))
         {
-            int barcodeY = Math.Max(top + (printed * lineHeight) + 8, LabelLengthDots - 120);
-            sb.Append("^BY2,2,80\n");
-            sb.Append($"^FO{left},{barcodeY}^BCN,80,Y,N,N^FD{barcodeData}^FS\n");
+            int barcodeHeight = PrinterDpi >= 300 ? 110 : 80;
+            int naturalY = top + (printed * lineHeight) + 12;
+            int maxY = LabelLengthDots - barcodeHeight - (PrinterDpi >= 300 ? 30 : 20);
+            int barcodeY = Math.Min(naturalY, maxY);
+            sb.Append(PrinterDpi >= 300 ? "^BY3,2,110\n" : "^BY2,2,80\n");
+            sb.Append($"^FO{left},{barcodeY}^BCN,{barcodeHeight},Y,N,N^FD{barcodeData}^FS\n");
         }
 
         return sb.ToString();
@@ -669,18 +779,38 @@ public class PrinterWorker : BackgroundService
         return hex.ToUpperInvariant();
     }
 
-    private static bool IsPdfBase64(string content) // pure utility, stays static
+    private static bool IsPdfBase64(string content)
     {
-        return content.Trim().StartsWith("JVBER");
-    }
-
-    private static bool IsPdfUrl(string content) // pure utility, stays static
-    {
-        if (!Uri.TryCreate(content?.Trim(), UriKind.Absolute, out var uri))
+        if (string.IsNullOrWhiteSpace(content))
             return false;
 
-        return (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps) &&
-               uri.AbsoluteUri.Contains(".pdf", StringComparison.OrdinalIgnoreCase);
+        string trimmed = content.Trim();
+        if (trimmed.StartsWith("JVBER", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (trimmed.StartsWith("data:application/pdf", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        int commaIdx = trimmed.IndexOf(',');
+        if (commaIdx >= 0 && commaIdx < 100)
+        {
+            string payload = trimmed.Substring(commaIdx + 1).TrimStart();
+            if (payload.StartsWith("JVBER", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsPdfUrl(string content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+            return false;
+
+        if (!Uri.TryCreate(content.Trim(), UriKind.Absolute, out var uri))
+            return false;
+
+        return uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps;
     }
 
     private string ConvertPdfToZplGraphics(string base64Pdf)
@@ -725,11 +855,34 @@ public class PrinterWorker : BackgroundService
 
                 labelTopShift = Math.Clamp(labelTopShift, -120, 120);
 
-                int availableWidth = Math.Max(50, LabelWidthDots - targetX);
-                int availableHeight = Math.Max(50, LabelLengthDots - targetY);
+                // Flap reference area for jewelry tags (Right flap is right 50% of the label)
+                int defaultFlapOffsetX = LabelWidthDots / 2;
+                int referenceFlapWidth = PrintAreaWidthDots > 0 ? PrintAreaWidthDots : Math.Max(50, LabelWidthDots - defaultFlapOffsetX);
+                int referenceFlapHeight = PrintAreaHeightDots > 0 ? PrintAreaHeightDots : LabelLengthDots;
+
+                int availableWidth = Math.Max(50, referenceFlapWidth);
+                int availableHeight = Math.Max(50, referenceFlapHeight);
 
                 // 3. Scale proportionally using PdfSizePercent, guaranteed never to cut off on right or bottom
                 using var resized = ResizeForLabel(prepared, availableWidth, availableHeight);
+
+                // If AutoCenterOnFlap is enabled, auto-calculate center; otherwise use PrintOffsetX & PrintOffsetY directly
+                if (AutoCenterOnFlap)
+                {
+                    targetX = defaultFlapOffsetX + Math.Max(0, (referenceFlapWidth - resized.Width) / 2);
+                    targetY = Math.Max(0, (referenceFlapHeight - resized.Height) / 2);
+                }
+
+                // Hard boundary safety clamp: ensure graphic never spills over right or bottom physical edges
+                if (targetX + resized.Width > LabelWidthDots)
+                {
+                    targetX = Math.Max(0, LabelWidthDots - resized.Width);
+                }
+
+                if (targetY + resized.Height > LabelLengthDots)
+                {
+                    targetY = Math.Max(0, LabelLengthDots - resized.Height);
+                }
 
                 _logger.LogInformation("Placing graphic: X={X}, Y={Y}, Size={W}x{H}, LabelTopShift={LT}",
                     targetX, targetY, resized.Width, resized.Height, labelTopShift);
@@ -820,6 +973,10 @@ public class PrinterWorker : BackgroundService
                 }
             }
         }
+        if (hexCharsOnLine > 0)
+        {
+            sb.Append("\n");
+        }
         sb.Append("^FS\n");
         hasInk = nonZeroBytes > 0;
         return sb.ToString();
@@ -830,28 +987,20 @@ public class PrinterWorker : BackgroundService
     private SKBitmap ResizeForLabel(SKBitmap source, int maxAvailableWidth, int maxAvailableHeight)
     {
         if (source.Width <= 0 || source.Height <= 0)
-            return source;
+            return source.Copy();
 
-        // Scale based on PdfSizePercent (percentage of available width)
+        // Scale proportionally within both width AND height boundaries defined by PdfSizePercent
         float scaleFactor = Math.Clamp(PdfSizePercent, 10, 200) / 100.0f;
-        int targetWidth = Math.Max(1, (int)Math.Round(maxAvailableWidth * scaleFactor));
+        int targetMaxWidth = Math.Max(1, (int)Math.Floor(maxAvailableWidth * scaleFactor));
+        int targetMaxHeight = Math.Max(1, (int)Math.Floor(maxAvailableHeight * scaleFactor));
 
-        // Maintain exact aspect ratio
-        float aspectRatio = (float)source.Height / source.Width;
-        int targetHeight = Math.Max(1, (int)Math.Round(targetWidth * aspectRatio));
+        // Uniform proportional scale (fit inside target box maintaining exact aspect ratio)
+        float scaleW = (float)targetMaxWidth / source.Width;
+        float scaleH = (float)targetMaxHeight / source.Height;
+        float scale = Math.Min(scaleW, scaleH);
 
-        // Ensure target dimensions never exceed available label boundaries
-        if (targetHeight > maxAvailableHeight)
-        {
-            targetHeight = maxAvailableHeight;
-            targetWidth = Math.Max(1, (int)Math.Round(targetHeight / aspectRatio));
-        }
-
-        if (targetWidth > maxAvailableWidth)
-        {
-            targetWidth = maxAvailableWidth;
-            targetHeight = Math.Max(1, (int)Math.Round(targetWidth * aspectRatio));
-        }
+        int targetWidth = Math.Clamp((int)Math.Floor(source.Width * scale), 1, maxAvailableWidth);
+        int targetHeight = Math.Clamp((int)Math.Floor(source.Height * scale), 1, maxAvailableHeight);
 
         var resized = new SKBitmap(targetWidth, targetHeight, source.ColorType, source.AlphaType);
         bool scaled = source.ScalePixels(resized, new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
@@ -891,16 +1040,17 @@ public class PrinterWorker : BackgroundService
 
     private string AdjustZplCommandCoordinates(string zpl, string command)
     {
-        var pattern = $@"\^{command}(-?\d+),(-?\d+)";
+        var pattern = $@"\^{command}(-?\d+),(-?\d+)(?:,([0-2]))?";
         int replacements = 0;
 
         var adjusted = Regex.Replace(zpl, pattern, match =>
         {
-            int x = int.Parse(match.Groups[1].Value) + PrintOffsetX;
-            int y = int.Parse(match.Groups[2].Value) + PrintOffsetY;
+            int x = Math.Max(0, int.Parse(match.Groups[1].Value) + PrintOffsetX);
+            int y = Math.Max(0, int.Parse(match.Groups[2].Value) + PrintOffsetY);
+            string extra = match.Groups[3].Success ? $",{match.Groups[3].Value}" : "";
 
             replacements++;
-            return $"^{command}{x},{y}";
+            return $"^{command}{x},{y}{extra}";
         });
 
         if (replacements > 0)
@@ -953,7 +1103,7 @@ public class PrinterWorker : BackgroundService
             }
 
             if (right < left || bottom < top)
-                return source;
+                return source.Copy();
 
             int paddingX = 4;
             int paddingY = 4;
@@ -967,7 +1117,7 @@ public class PrinterWorker : BackgroundService
             int cropHeight = Math.Max(1, cropBottom - cropTop);
 
             if (cropWidth == source.Width && cropHeight == source.Height && cropLeft == 0 && cropTop == 0)
-                return source;
+                return source.Copy();
 
             var cropped = new SKBitmap(cropWidth, cropHeight, source.ColorType, source.AlphaType);
             using var canvas = new SKCanvas(cropped);
@@ -983,11 +1133,23 @@ public class PrinterWorker : BackgroundService
 
     private string BuildSimpleBarcodeLabel(string barcode, string rfidCmd)
     {
-        return $"^XA\n^PQ1\n^PW{LabelWidthDots}\n^LL{LabelLengthDots}\n{rfidCmd}^CF0,30\n^FO40,40^FD{barcode}^FS\n^BY3,2,120\n^FO40,100^BCN,120,Y,N,N\n^FD{barcode}^FS\n^XZ";
+        int fontSize = PrinterDpi >= 300 ? 40 : 30;
+        int barcodeHeight = PrinterDpi >= 300 ? 160 : 120;
+        int x = PrintOffsetX > 0 ? PrintOffsetX : 40;
+        return $"^XA\n^PQ1\n^PW{LabelWidthDots}\n^LL{LabelLengthDots}\n{rfidCmd}^CF0,{fontSize}\n^FO{x},40^FD{barcode}^FS\n^BY3,2,{barcodeHeight}\n^FO{x},120^BCN,{barcodeHeight},Y,N,N\n^FD{barcode}^FS\n^XZ";
     }
 
     private async Task SendToPrinterAsync(byte[] data)
     {
+        if (data == null || data.Length == 0)
+        {
+            _logger.LogWarning("SendToPrinterAsync called with null or empty printer data. Skipping send.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(PrinterIp))
+            throw new InvalidOperationException("PrinterIp is not configured in appsettings.json.");
+
         const int maxAttempts = 3;
         Exception? lastError = null;
 
@@ -1027,7 +1189,18 @@ public class PrinterWorker : BackgroundService
 
     private async Task UpdateStatusAsync(int jobId, string status, string? error)
     {
-        await _httpClient.PatchAsJsonAsync($"{CloudApiUrl}/{jobId}/status", new { Status = status, ErrorMessage = error });
+        try
+        {
+            var response = await _httpClient.PatchAsJsonAsync($"{CloudApiUrl}/{jobId}/status", new { Status = status, ErrorMessage = error });
+            if (!response.IsSuccessStatusCode)
+            {
+                _logger.LogWarning("Status update for Job {Id} to {Status} failed. API returned HTTP {StatusCode}", jobId, status, response.StatusCode);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not update status for Job {Id} to {Status}: {Message}", jobId, status, ex.Message);
+        }
     }
 }
 
