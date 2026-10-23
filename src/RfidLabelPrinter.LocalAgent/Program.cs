@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -84,7 +85,7 @@ public class PrinterWorker : BackgroundService
     private int LabelLengthDots = DefaultLabelLengthDots;
     private bool PrintPdfAsGraphics = true;
 
-    // --- Clean Positioning & Sizing Controls ---
+    // --- Clean Positioning & Sizing Controls (All Configurable via appsettings.json) ---
     private int PrintOffsetX = 590;
     private int PrintOffsetY = 15;
     private int PdfSizePercent = 55;
@@ -92,6 +93,9 @@ public class PrinterWorker : BackgroundService
     private bool AutoTrimWhitespace = true;
     private bool SingleSidePrintOnLowerFlap = true;
     private int SingleSideOffsetY = 0;
+    private float TemplateBaseTopPercent = 22.5f;
+    private int SingleSideThresholdPercent = 45;
+    private int TrimPaddingDots = 4;
     private int LabelTopShiftDots = 0;
     private int PrintAreaWidthDots = 0;
     private int PrintAreaHeightDots = 0;
@@ -246,6 +250,19 @@ public class PrinterWorker : BackgroundService
 
         SingleSidePrintOnLowerFlap = bool.TryParse(_config["AgentSettings:SingleSidePrintOnLowerFlap"], out var ssLower) ? ssLower : true;
         SingleSideOffsetY = ParseInt(_config["AgentSettings:SingleSideOffsetY"], 0);
+
+        TemplateBaseTopPercent = float.TryParse(
+            _config["AgentSettings:TemplateBaseTopPercent"]?.Trim(),
+            NumberStyles.Float,
+            CultureInfo.InvariantCulture,
+            out var tbTop) ? tbTop : 22.5f;
+
+        SingleSideThresholdPercent = Math.Clamp(
+            ParseInt(_config["AgentSettings:SingleSideThresholdPercent"], 45),
+            10,
+            90);
+
+        TrimPaddingDots = Math.Max(0, ParseInt(_config["AgentSettings:TrimPaddingDots"], 4));
 
         LabelTopShiftDots = ParseInt(_config["AgentSettings:LabelTopShiftDots"], 0);
 
@@ -851,8 +868,8 @@ public class PrinterWorker : BackgroundService
                     : skBitmap.Copy();
 
                 float topRatio = (float)cropTop / origHeight;
-                // Single-sided label detection: all ink is in lower half of template (no top wing content)
-                bool isSingleSideLower = topRatio >= 0.45f;
+                // Single-sided label detection based on configured threshold:
+                bool isSingleSideLower = topRatio >= (SingleSideThresholdPercent / 100.0f);
 
                 // 2. Determine printable bounds based on PrintOffsetX and PrintOffsetY
                 int targetX = Math.Max(0, PrintOffsetX);
@@ -880,6 +897,11 @@ public class PrinterWorker : BackgroundService
                 // 3. Scale proportionally using PdfSizePercent, guaranteed never to cut off on right or bottom
                 using var resized = ResizeForLabel(prepared, availableWidth, availableHeight);
 
+                // Base reference top for 4-line reverse wing template based on configured percentage
+                int baseTop = (int)Math.Round(origHeight * (TemplateBaseTopPercent / 100.0f));
+                float scaleH = (float)resized.Height / Math.Max(1, prepared.Height);
+                int verticalShift = Math.Max(0, (int)Math.Round((cropTop - baseTop) * scaleH));
+
                 // Automatic vertical handling for Single-Sided vs Double-Sided labels:
                 if (SingleSidePrintOnLowerFlap && isSingleSideLower)
                 {
@@ -889,11 +911,7 @@ public class PrinterWorker : BackgroundService
                     }
                     else
                     {
-                        // Calculate offset aligning with lower wing position of double-sided templates:
-                        int baseTop = (int)(origHeight * 0.225f);
-                        float scaleH = (float)resized.Height / Math.Max(1, prepared.Height);
-                        int offsetFromUpperWing = Math.Max(0, (int)Math.Round((cropTop - baseTop) * scaleH));
-                        targetY = PrintOffsetY + offsetFromUpperWing;
+                        targetY = PrintOffsetY + verticalShift;
 
                         // Ensure content cleanly lands on lower flap (lower 50% of label)
                         int lowerFlapStart = LabelLengthDots / 2;
@@ -908,7 +926,10 @@ public class PrinterWorker : BackgroundService
                 }
                 else
                 {
-                    // If AutoCenterOnFlap is enabled for double-sided designs
+                    // Double-Sided label (3-line or 4-line reverse wing):
+                    // Anchor to template coordinates so 3-line and 4-line fold margins never slide!
+                    targetY = PrintOffsetY + verticalShift;
+
                     if (AutoCenterOnFlap)
                     {
                         targetY = Math.Max(0, (referenceFlapHeight - resized.Height) / 2);
@@ -1163,8 +1184,8 @@ public class PrinterWorker : BackgroundService
             if (right < left || bottom < top)
                 return source.Copy();
 
-            int paddingX = 4;
-            int paddingY = 4;
+            int paddingX = TrimPaddingDots;
+            int paddingY = TrimPaddingDots;
 
             cropLeft = Math.Max(0, left - paddingX);
             cropTop = Math.Max(0, top - paddingY);
